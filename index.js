@@ -97,6 +97,11 @@ let taskId = 0;
 let lastProtectionCheck = 0;
 let lastSurvivalCheck = 0;
 let lastDoorCheck = 0;
+let lastSelfDefenseCheck = 0;
+let lastGearCheck = 0;
+
+let stuckSince = 0;
+let lastPosition = null;
 
 // ============================================================
 // LOCATION MEMORY
@@ -162,6 +167,12 @@ bot.once("spawn", () => {
     // Do not make dangerous large drops.
     defaultMovements.maxDropDown = 3;
 
+    // Let pathfinder open doors/gates itself while walking a path.
+    // (mineflayer-pathfinder ships this OFF by default; we back it
+    // up with a manual watchdog below since it isn't 100% reliable
+    // on its own, especially during GoalFollow.)
+    defaultMovements.canOpenDoors = true;
+
     bot.pathfinder.setMovements(defaultMovements);
 
     loadLocations();
@@ -170,6 +181,9 @@ bot.once("spawn", () => {
     bot.chat("I can move, mine, fight, craft, remember places and do tasks.");
 
     console.log("Loaded locations:", locations);
+
+    // Put on whatever armor we're carrying right away.
+    equipArmor().catch(() => {});
 });
 
 // ============================================================
@@ -201,14 +215,61 @@ bot.on("chat", async (username, message) => {
         return;
     }
 
+    const normalized = cleanMessage.toLowerCase().trim();
+
     // Stop should work even while another task is running.
     if (
-        cleanMessage.toLowerCase() === "stop" ||
-        cleanMessage.toLowerCase().includes("stop what you're doing") ||
-        cleanMessage.toLowerCase().includes("stop everything")
+        normalized === "stop" ||
+        normalized.includes("stop what you're doing") ||
+        normalized.includes("stop everything")
     ) {
         const response = await stopEverything();
         bot.chat(response);
+        return;
+    }
+
+    // Fast-path commands: skip the AI round-trip for a handful of
+    // common, safety-relevant requests so they're instant and never
+    // fail because of a bad AI response.
+
+    if (
+        normalized === "sethome" ||
+        normalized === "set home" ||
+        normalized === "remember this as home" ||
+        normalized === "this is home"
+    ) {
+        bot.chat(await rememberLocation("home"));
+        return;
+    }
+
+    if (
+        normalized === "go home" ||
+        normalized === "gohome" ||
+        normalized === "come home" ||
+        normalized === "return home"
+    ) {
+        bot.chat(await goToLocation("home"));
+        return;
+    }
+
+    if (
+        normalized === "gear up" ||
+        normalized === "gearup" ||
+        normalized === "equip gear" ||
+        normalized === "equip your gear"
+    ) {
+        bot.chat(await gearUp());
+        return;
+    }
+
+    if (
+        normalized === "sort inventory" ||
+        normalized === "sort your inventory" ||
+        normalized === "sort my inventory" ||
+        normalized === "tidy inventory" ||
+        normalized === "tidy up your inventory"
+    ) {
+        bot.chat(await sortInventory());
         return;
     }
 
@@ -231,6 +292,24 @@ function getInventorySummary() {
     return Object.entries(items)
         .map(([name, count]) => `${name} x${count}`)
         .join(", ") || "empty";
+}
+
+function getEquippedSummary() {
+    if (!bot.inventory) return "unknown";
+
+    const slots = bot.inventory.slots;
+    const names = [];
+
+    // 5 = head, 6 = torso, 7 = legs, 8 = feet in mineflayer's slot map.
+    for (const slotIndex of [5, 6, 7, 8]) {
+        const item = slots[slotIndex];
+        if (item) names.push(item.name);
+    }
+
+    const heldItem = bot.heldItem;
+    if (heldItem) names.push(`${heldItem.name} (hand)`);
+
+    return names.join(", ") || "nothing";
 }
 
 function getNearbyPlayers() {
@@ -292,6 +371,9 @@ ${getNearbyEntities()}
 
 INVENTORY:
 ${getInventorySummary()}
+
+EQUIPPED:
+${getEquippedSummary()}
 
 MEMORIZED LOCATIONS:
 ${Object.keys(locations).length
@@ -398,7 +480,142 @@ async function stopEverything() {
 }
 
 // ============================================================
-// PROTECTION
+// GEAR / ARMOR / WEAPONS
+// ============================================================
+
+const ARMOR_SLOTS = {
+    head: [
+        "diamond_helmet",
+        "iron_helmet",
+        "chainmail_helmet",
+        "golden_helmet",
+        "turtle_helmet",
+        "leather_helmet"
+    ],
+    torso: [
+        "diamond_chestplate",
+        "iron_chestplate",
+        "chainmail_chestplate",
+        "golden_chestplate",
+        "leather_chestplate"
+    ],
+    legs: [
+        "diamond_leggings",
+        "iron_leggings",
+        "chainmail_leggings",
+        "golden_leggings",
+        "leather_leggings"
+    ],
+    feet: [
+        "diamond_boots",
+        "iron_boots",
+        "chainmail_boots",
+        "golden_boots",
+        "leather_boots"
+    ]
+};
+
+const WEAPON_ORDER = [
+    "netherite_sword",
+    "diamond_sword",
+    "iron_sword",
+    "stone_sword",
+    "golden_sword",
+    "wooden_sword",
+    "netherite_axe",
+    "diamond_axe",
+    "iron_axe",
+    "stone_axe",
+    "golden_axe",
+    "wooden_axe"
+];
+
+// Only touches armor slots, never the hand, so it's safe to run in
+// the background even while mining/fighting/building.
+async function equipArmor() {
+    if (!bot.inventory) return false;
+
+    let equippedAny = false;
+
+    for (const [slot, items] of Object.entries(ARMOR_SLOTS)) {
+        for (const name of items) {
+            const item = findInventoryItem(name);
+
+            if (!item) continue;
+
+            const currentlyWorn = getWornArmorName(slot);
+
+            if (currentlyWorn === name) break;
+
+            try {
+                await bot.equip(item, slot);
+                equippedAny = true;
+            } catch (error) {
+                console.log("Armor equip error:", error.message);
+            }
+
+            break;
+        }
+    }
+
+    return equippedAny;
+}
+
+function getWornArmorName(slot) {
+    const slotIndexes = { head: 5, torso: 6, legs: 7, feet: 8 };
+    const index = slotIndexes[slot];
+
+    if (index == null || !bot.inventory) return null;
+
+    const item = bot.inventory.slots[index];
+
+    return item ? item.name : null;
+}
+
+// Only call this right before combat - it touches the hand slot,
+// which would otherwise fight with pickaxe-swapping during mining.
+async function equipBestWeapon() {
+    for (const name of WEAPON_ORDER) {
+        const item = findInventoryItem(name);
+
+        if (item) {
+            try {
+                await bot.equip(item, "hand");
+                return true;
+            } catch (error) {
+                console.log("Weapon equip error:", error.message);
+            }
+        }
+    }
+
+    return false;
+}
+
+async function equipShield() {
+    const shield = findInventoryItem("shield");
+
+    if (!shield) return false;
+
+    try {
+        await bot.equip(shield, "off-hand");
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+async function gearUp() {
+    const armorDone = await equipArmor();
+    const weaponDone = await equipBestWeapon();
+    await equipShield();
+
+    return armorDone || weaponDone
+        ? "I geared up."
+        : "I don't have any armor or weapons to equip.";
+}
+
+// ============================================================
+// PROTECTION / SELF-DEFENSE
 // ============================================================
 
 const HOSTILE_MOBS = new Set([
@@ -520,8 +737,66 @@ async function protectTick() {
     }
 
     try {
+        await equipBestWeapon();
         bot.pvp.attack(threat);
     } catch {}
+}
+
+// Self-preservation: runs ALL the time, not just while "protecting"
+// someone, so the bot fights back or flees even when idle/alone.
+async function selfDefenseTick() {
+    if (!bot.entity) return;
+
+    // Critical health: disengage and run from the nearest threat.
+    if (bot.health <= 6) {
+        try {
+            bot.pvp.stop();
+        } catch {}
+
+        const threat = bot.nearestEntity(entity => {
+            return (
+                isHostile(entity) &&
+                entity.position.distanceTo(bot.entity.position) <= 8
+            );
+        });
+
+        if (threat) {
+            const awayX =
+                bot.entity.position.x -
+                (threat.position.x - bot.entity.position.x) * 4;
+
+            const awayZ =
+                bot.entity.position.z -
+                (threat.position.z - bot.entity.position.z) * 4;
+
+            bot.pathfinder.setGoal(
+                new goals.GoalXZ(
+                    Math.floor(awayX),
+                    Math.floor(awayZ)
+                )
+            );
+        }
+
+        return;
+    }
+
+    // Already mid-fight (protectTick or a manual attack) - don't
+    // double-target.
+    if (bot.pvp.target) return;
+
+    const threat = bot.nearestEntity(entity => {
+        return (
+            isHostile(entity) &&
+            entity.position.distanceTo(bot.entity.position) <= 6
+        );
+    });
+
+    if (threat) {
+        try {
+            await equipBestWeapon();
+            bot.pvp.attack(threat);
+        } catch {}
+    }
 }
 
 // ============================================================
@@ -561,19 +836,32 @@ function findInventoryItem(itemName) {
 }
 
 function getFirstFood() {
+    // Cooked/prepared food first (best saturation), then raw food as
+    // a fallback so the bot never starves just because nothing is
+    // cooked yet.
     const foods = [
         "cooked_beef",
         "cooked_porkchop",
         "cooked_chicken",
         "cooked_mutton",
         "cooked_rabbit",
+        "cooked_cod",
+        "cooked_salmon",
         "bread",
         "baked_potato",
         "golden_carrot",
         "apple",
         "carrot",
         "potato",
-        "beetroot"
+        "beetroot",
+        "beef",
+        "porkchop",
+        "chicken",
+        "mutton",
+        "rabbit",
+        "cod",
+        "salmon",
+        "rotten_flesh"
     ];
 
     for (const name of foods) {
@@ -608,6 +896,94 @@ async function eatFood() {
 }
 
 // ============================================================
+// COOKING
+// ============================================================
+
+const RAW_TO_COOKED = {
+    beef: "cooked_beef",
+    porkchop: "cooked_porkchop",
+    chicken: "cooked_chicken",
+    mutton: "cooked_mutton",
+    rabbit: "cooked_rabbit",
+    cod: "cooked_cod",
+    salmon: "cooked_salmon",
+    potato: "baked_potato"
+};
+
+async function findNearbyFurnace() {
+    return bot.findBlock({
+        matching: block => {
+            if (!block) return false;
+
+            return (
+                block.name === "furnace" ||
+                block.name === "blast_furnace" ||
+                block.name === "smoker"
+            );
+        },
+        maxDistance: 8
+    });
+}
+
+async function cookFood() {
+    const furnaceBlock = await findNearbyFurnace();
+
+    if (!furnaceBlock) {
+        return "I can't find a furnace nearby.";
+    }
+
+    let rawItem = null;
+    let rawName = null;
+
+    for (const raw of Object.keys(RAW_TO_COOKED)) {
+        const item = findInventoryItem(raw);
+
+        if (item) {
+            rawItem = item;
+            rawName = raw;
+            break;
+        }
+    }
+
+    if (!rawItem) {
+        return "I don't have any raw food to cook.";
+    }
+
+    const fuel =
+        findInventoryItem("coal") ||
+        findInventoryItem("charcoal") ||
+        findInventoryItem("oak_planks") ||
+        findInventoryItem("stick");
+
+    if (!fuel) {
+        return "I don't have any fuel to cook with.";
+    }
+
+    try {
+        const furnace = await bot.openFurnace(furnaceBlock);
+
+        await furnace.putFuel(fuel.type, null, Math.min(fuel.count, 8));
+        await furnace.putInput(rawItem.type, null, rawItem.count);
+
+        // Give it time to smelt (roughly 10s/item, capped).
+        const waitMs = Math.min(rawItem.count * 10000, 60000);
+
+        await new Promise(resolve => setTimeout(resolve, waitMs));
+
+        try {
+            await furnace.takeOutput();
+        } catch {}
+
+        furnace.close();
+
+        return `I cooked some ${rawName}.`;
+    } catch (error) {
+        console.log("Cook error:", error.message);
+        return "I couldn't cook right now.";
+    }
+}
+
+// ============================================================
 // SURVIVAL
 // ============================================================
 
@@ -623,12 +999,11 @@ async function survivalCheck() {
         if (!taskRunning) {
             bot.pathfinder.setGoal(null);
         }
-
-        return;
     }
 
-    // Automatically eat when extremely hungry.
-    if (bot.food <= 7 && !taskRunning) {
+    // Eat when hungry - this now runs even during a task, so the bot
+    // doesn't starve mid-build or mid-mine.
+    if (bot.food <= 14) {
         await eatFood();
     }
 }
@@ -1040,6 +1415,8 @@ async function sleep() {
     try {
         await bot.sleep(bed);
 
+        // Sleeping in a bed also sets the bot's vanilla respawn
+        // point, so this doubles as "set my respawn here".
         return "I'm sleeping.";
     } catch (error) {
         return `I couldn't sleep: ${error.message}`;
@@ -1076,7 +1453,7 @@ async function openNearbyDoor() {
 
     const door = bot.findBlock({
         matching: block => isDoor(block),
-        maxDistance: 3
+        maxDistance: 4
     });
 
     if (!door) return;
@@ -1105,6 +1482,28 @@ async function openNearbyDoor() {
     } finally {
         doorBusy = false;
     }
+}
+
+// Detects "stuck against something while trying to path somewhere"
+// so we can force a door check even outside the normal timer.
+function checkStuck() {
+    if (!bot.entity || !bot.pathfinder || !bot.pathfinder.goal) {
+        stuckSince = 0;
+        lastPosition = null;
+        return false;
+    }
+
+    const pos = bot.entity.position;
+
+    if (lastPosition && pos.distanceTo(lastPosition) < 0.08) {
+        if (!stuckSince) stuckSince = Date.now();
+    } else {
+        stuckSince = 0;
+    }
+
+    lastPosition = pos.clone();
+
+    return !!stuckSince && (Date.now() - stuckSince > 1500);
 }
 
 // ============================================================
@@ -1159,6 +1558,62 @@ async function depositItem(itemName, amount = null) {
         console.log("Chest error:", error.message);
         return `I couldn't put ${itemName} into the chest.`;
     }
+}
+
+// ============================================================
+// SORT / TIDY INVENTORY
+// ============================================================
+
+async function sortInventory() {
+    if (!bot.inventory) return "Inventory isn't ready.";
+
+    const items = bot.inventory.items();
+    const byType = {};
+
+    for (const item of items) {
+        const key = `${item.type}_${item.metadata}`;
+
+        if (!byType[key]) byType[key] = [];
+
+        byType[key].push(item);
+    }
+
+    let merges = 0;
+
+    for (const key of Object.keys(byType)) {
+        const stacks = byType[key].sort((a, b) => a.slot - b.slot);
+
+        for (let i = 0; i < stacks.length; i++) {
+            const target = stacks[i];
+
+            if (!target || target.count >= target.stackSize) continue;
+
+            for (let j = i + 1; j < stacks.length; j++) {
+                const source = stacks[j];
+
+                if (!source || source.count <= 0) continue;
+
+                const space = target.stackSize - target.count;
+
+                if (space <= 0) break;
+
+                const moveAmount = Math.min(space, source.count);
+
+                try {
+                    await bot.moveSlotItem(source.slot, target.slot);
+                    merges++;
+                    target.count += moveAmount;
+                    source.count -= moveAmount;
+                } catch (error) {
+                    // A failed move here is non-fatal - just move on.
+                }
+            }
+        }
+    }
+
+    return merges > 0
+        ? `I tidied up my inventory (merged ${merges} stack${merges === 1 ? "" : "s"}).`
+        : "My inventory is already tidy.";
 }
 
 // ============================================================
@@ -1218,6 +1673,7 @@ async function attackTarget(targetName = null) {
     }
 
     try {
+        await equipBestWeapon();
         bot.pvp.attack(target);
 
         return `I'm attacking the ${target.name}.`;
@@ -1377,12 +1833,16 @@ async function buildStarterHouse() {
     // --------------------------------------------------------
     // FLOOR
     // --------------------------------------------------------
+    // NOTE: this goes one block BELOW the bot's feet (origin.y - 1),
+    // not at origin.y (which is where the bot is standing - placing
+    // there just fought with the bot's own hitbox and left a gap in
+    // the walls at foot level).
 
     for (let x = 0; x < width; x++) {
         for (let z = 0; z < depth; z++) {
             const position = origin.offset(
                 x - 3,
-                0,
+                -1,
                 z - 3
             );
 
@@ -1400,8 +1860,10 @@ async function buildStarterHouse() {
     // --------------------------------------------------------
     // WALLS
     // --------------------------------------------------------
+    // Starts at y = 0 (foot level) now, so there's no open gap
+    // between the floor and the bottom of the walls.
 
-    for (let y = 1; y <= wallHeight; y++) {
+    for (let y = 0; y <= wallHeight; y++) {
         for (let x = 0; x < width; x++) {
             for (let z = 0; z < depth; z++) {
 
@@ -1413,11 +1875,11 @@ async function buildStarterHouse() {
 
                 if (!edge) continue;
 
-                // Leave a simple doorway.
+                // Leave a simple doorway, two blocks tall.
                 if (
                     x === Math.floor(width / 2) &&
                     z === 0 &&
-                    y <= 2
+                    y <= 1
                 ) {
                     continue;
                 }
@@ -1472,6 +1934,25 @@ async function buildStarterHouse() {
 // BASIC FARM
 // ============================================================
 
+const CROP_MATURITY = {
+    wheat: 7,
+    carrots: 7,
+    potatoes: 7,
+    beetroots: 3
+};
+
+function isCropMature(block) {
+    if (!block) return false;
+
+    const maxAge = CROP_MATURITY[block.name];
+
+    if (maxAge == null) return false;
+
+    const props = block.getProperties ? block.getProperties() : null;
+
+    return props && Number(props.age) >= maxAge;
+}
+
 async function findWater() {
     return bot.findBlock({
         matching: block => {
@@ -1504,60 +1985,53 @@ async function farmHere() {
         "beetroot_seeds"
     ];
 
-    let seedItem = null;
-
-    for (const name of seeds) {
-        seedItem = findInventoryItem(name);
-
-        if (seedItem) break;
-    }
-
-    if (!seedItem) {
-        return "I don't have seeds or crops to plant.";
-    }
-
-    let planted = 0;
-
     const center = farmland.position;
+
+    let harvested = 0;
+    let planted = 0;
 
     for (let dx = -3; dx <= 3; dx++) {
         for (let dz = -3; dz <= 3; dz++) {
-            const crop = bot.blockAt(
-                center.offset(dx, 1, dz)
-            );
+            const soil = bot.blockAt(center.offset(dx, 0, dz));
 
-            const soil = bot.blockAt(
-                center.offset(dx, 0, dz)
-            );
+            if (!soil || soil.name !== "farmland") continue;
 
-            if (
-                !crop ||
-                !soil ||
-                soil.name !== "farmland"
-            ) {
-                continue;
+            const cropPos = center.offset(dx, 1, dz);
+            const crop = bot.blockAt(cropPos);
+
+            // Harvest anything that's fully grown.
+            if (crop && isCropMature(crop)) {
+                try {
+                    await bot.dig(crop);
+                    harvested++;
+                } catch (error) {
+                    console.log("Harvest error:", error.message);
+                }
             }
 
-            if (crop.name !== "air") {
-                continue;
+            // Replant if the spot is now (or already) empty.
+            const afterHarvest = bot.blockAt(cropPos);
+
+            if (afterHarvest && afterHarvest.name === "air") {
+                let seedItem = null;
+
+                for (const name of seeds) {
+                    seedItem = findInventoryItem(name);
+                    if (seedItem) break;
+                }
+
+                if (seedItem) {
+                    try {
+                        if (await placeBlockAt(cropPos, seedItem.name)) {
+                            planted++;
+                        }
+                    } catch {}
+                }
             }
-
-            if (countItem(seedItem.name) <= 0) {
-                return `I planted ${planted} crops.`;
-            }
-
-            try {
-                await placeBlockAt(
-                    crop.position,
-                    seedItem.name
-                );
-
-                planted++;
-            } catch {}
         }
     }
 
-    return `I planted ${planted} crops.`;
+    return `I harvested ${harvested} crops and planted ${planted}.`;
 }
 
 // ============================================================
@@ -1712,6 +2186,17 @@ async function executeStep(step, owner, localTaskId) {
                 step.item || step.target
             );
 
+        case "gear_up":
+        case "equip_armor":
+            return await gearUp();
+
+        case "cook":
+            return await cookFood();
+
+        case "sort_inventory":
+        case "sort":
+            return await sortInventory();
+
         case "eat":
             return await eatFood();
 
@@ -1763,6 +2248,7 @@ async function executeStep(step, owner, localTaskId) {
             return await buildStarterHouse();
 
         case "farm":
+        case "harvest":
             return await farmHere();
 
         case "craft_tools":
@@ -1911,6 +2397,9 @@ get_item
 craft
 craft_tools
 equip
+gear_up
+cook
+sort_inventory
 eat
 sleep
 wake
@@ -1922,6 +2411,7 @@ deposit
 build
 build_house
 farm
+harvest
 chat
 
 ============================================================
@@ -1981,6 +2471,24 @@ CRAFT:
   "amount": 1
 }
 
+GEAR UP (equip best armor/weapon/shield it's carrying):
+
+{
+  "action": "gear_up"
+}
+
+COOK (needs a furnace nearby, raw food and fuel in inventory):
+
+{
+  "action": "cook"
+}
+
+SORT INVENTORY (merge partial item stacks):
+
+{
+  "action": "sort_inventory"
+}
+
 GOTO:
 
 {
@@ -2010,7 +2518,7 @@ BUILD:
   "action": "build_house"
 }
 
-FARM:
+FARM / HARVEST (also harvests grown crops and replants):
 
 {
   "action": "farm"
@@ -2083,7 +2591,8 @@ skills, explain that briefly.
 6. If the player says "here", use the bot's current position.
 
 7. If the player says "home", "base", "mine", etc., use the
-memorized location if it exists.
+memorized location if it exists. If the player asks to set a
+home/respawn point, use "remember" with name "home".
 
 8. Keep the final response short because it will appear in
 Minecraft chat.
@@ -2243,6 +2752,21 @@ Output:
   "response": "I'll make some tools."
 }
 
+Request:
+"gear up"
+
+Output:
+
+{
+  "goal": "equip gear",
+  "steps": [
+    {
+      "action": "gear_up"
+    }
+  ],
+  "response": "Gearing up."
+}
+
 ============================================================
 FINAL RULE
 ============================================================
@@ -2376,7 +2900,22 @@ bot.on("physicsTick", () => {
     }
 
     // --------------------------------------------------------
-    // SURVIVAL
+    // SELF-DEFENSE (always on, not just while protecting someone)
+    // --------------------------------------------------------
+
+    if (now - lastSelfDefenseCheck > 600) {
+        lastSelfDefenseCheck = now;
+
+        selfDefenseTick().catch(error => {
+            console.log(
+                "Self-defense error:",
+                error.message
+            );
+        });
+    }
+
+    // --------------------------------------------------------
+    // SURVIVAL (eating/retreating - now runs during tasks too)
     // --------------------------------------------------------
 
     if (
@@ -2393,16 +2932,24 @@ bot.on("physicsTick", () => {
     }
 
     // --------------------------------------------------------
+    // GEAR (periodically put on any better armor picked up)
+    // --------------------------------------------------------
+
+    if (now - lastGearCheck > 15000) {
+        lastGearCheck = now;
+
+        equipArmor().catch(error => {
+            console.log("Gear check error:", error.message);
+        });
+    }
+
+    // --------------------------------------------------------
     // DOORS
     // --------------------------------------------------------
 
-    if (
-        now - lastDoorCheck > 1000 &&
-        (
-            taskRunning ||
-            followingPlayer
-        )
-    ) {
+    const stuck = checkStuck();
+
+    if (now - lastDoorCheck > 400 || stuck) {
         lastDoorCheck = now;
 
         openNearbyDoor().catch(() => {});
@@ -2416,12 +2963,9 @@ bot.on("physicsTick", () => {
 bot.on("entityHurt", entity => {
     if (!entity) return;
 
-    // If Kadoo itself is attacked while protecting,
-    // attempt to defend itself.
-    if (
-        entity === bot.entity &&
-        protectingPlayer
-    ) {
+    // If Kadoo itself is attacked, defend itself regardless of
+    // whether it's currently in "protect" mode.
+    if (entity === bot.entity) {
         const attacker = bot.nearestEntity(target => {
             if (!isHostile(target)) return false;
 
@@ -2433,11 +2977,43 @@ bot.on("entityHurt", entity => {
         });
 
         if (attacker) {
-            try {
-                bot.pvp.attack(attacker);
-            } catch {}
+            equipBestWeapon()
+                .catch(() => {})
+                .finally(() => {
+                    try {
+                        bot.pvp.attack(attacker);
+                    } catch {}
+                });
         }
     }
+});
+
+// ============================================================
+// DEATH / RESPAWN
+// ============================================================
+
+bot.on("death", () => {
+    console.log("Bot died.");
+
+    stopEverything();
+
+    // Give the server a few seconds to actually respawn the bot
+    // (at its bed spawn if one was set by sleeping, otherwise the
+    // world spawn) before trying anything.
+    setTimeout(async () => {
+        try {
+            bot.chat("I respawned.");
+
+            await equipArmor();
+
+            if (locations.home) {
+                bot.chat("Heading back to base.");
+                await goToLocation("home");
+            }
+        } catch (error) {
+            console.log("Respawn handling error:", error.message);
+        }
+    }, 3000);
 });
 
 // ============================================================
